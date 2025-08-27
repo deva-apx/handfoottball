@@ -1,0 +1,496 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+
+/**
+ * Number Pass & Shoot — Online 1v1 (no server)
+ * -------------------------------------------------
+ * Two players face each other.
+ * Attacker must complete 3 successful passes (numbers 1–3) without being matched by the Defender.
+ * If Defender picks the same number, possession switches.
+ * After 3 passes, Attacker takes a Shot (numbers 4–6):
+ *   - If Defender matches → SAVE.
+ *   - Else → GOAL.
+ * Game continues with possession switching after SAVE or GOAL.
+ *
+ * This component supports:
+ *  - Online multiplayer via WebRTC Data Channel with **manual copy‑paste signaling** (no backend needed).
+ *  - Same‑device hot‑seat mode.
+ *
+ * How to play online (manual signaling):
+ *  1) Player A clicks "Host Game" → copies the Offer blob and sends it to Player B (chat/DM).
+ *  2) Player B opens the page, clicks "Join Game", pastes the Offer, then copies the Answer blob back to A.
+ *  3) Player A pastes the Answer. Connection is established. Play!
+ */
+
+// --- Utility helpers ---
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function waitForIceGathering(pc) {
+  if (pc.iceGatheringState === "complete") return;
+  await new Promise(resolve => {
+    function check() {
+      if (pc.iceGatheringState === "complete") {
+        pc.removeEventListener("icegatheringstatechange", check);
+        resolve();
+      }
+    }
+    pc.addEventListener("icegatheringstatechange", check);
+  });
+}
+
+async function createOfferWithIce(pc) {
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  await waitForIceGathering(pc);
+  return JSON.stringify(pc.localDescription);
+}
+
+async function createAnswerWithIce(pc) {
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  await waitForIceGathering(pc);
+  return JSON.stringify(pc.localDescription);
+}
+
+// --- Game logic types ---
+const initialState = {
+  phase: "pass", // "pass" | "shot"
+  passesCompleted: 0, // 0..3
+  attackerSide: "A", // "A" (host) or "B" (joiner)
+  scoreA: 0,
+  scoreB: 0,
+  round: 1,
+  lastResult: "", // text feedback of previous resolution
+};
+
+function resolveRound(state, attackerPick, defenderPick) {
+  const next = { ...state };
+  if (state.phase === "pass") {
+    if (attackerPick === defenderPick) {
+      // Possession switches
+      next.passesCompleted = 0;
+      next.phase = "pass";
+      next.attackerSide = state.attackerSide === "A" ? "B" : "A";
+      next.lastResult = `DEFENDER MATCHED (${defenderPick}) → Turn switches!`;
+    } else {
+      next.passesCompleted += 1;
+      if (next.passesCompleted >= 3) {
+        next.phase = "shot";
+        next.lastResult = `3 PASSES! Prepare to SHOOT.`;
+      } else {
+        next.lastResult = `PASS SUCCESS (${attackerPick} vs ${defenderPick})`;
+      }
+    }
+  } else if (state.phase === "shot") {
+    if (attackerPick === defenderPick) {
+      // SAVE → switch
+      next.lastResult = `SHOT MATCHED (${defenderPick}) — SAVE! Possession switches.`;
+      next.phase = "pass";
+      next.passesCompleted = 0;
+      next.attackerSide = state.attackerSide === "A" ? "B" : "A";
+    } else {
+      // GOAL → score and switch
+      if (state.attackerSide === "A") next.scoreA += 1; else next.scoreB += 1;
+      next.lastResult = `GOAL! (${attackerPick} vs ${defenderPick})`;
+      next.phase = "pass";
+      next.passesCompleted = 0;
+      next.attackerSide = state.attackerSide === "A" ? "B" : "A";
+    }
+  }
+  next.round += 1;
+  return next;
+}
+
+// --- Main component ---
+export default function NumberPassShoot() {
+  // Connection mode
+  const [mode, setMode] = useState("online"); // "online" | "local"
+
+  // WebRTC
+  const [connState, setConnState] = useState("disconnected"); // disconnected | hosting | joining | connected
+  const [offerBlob, setOfferBlob] = useState("");
+  const [answerBlob, setAnswerBlob] = useState("");
+  const [remoteBlob, setRemoteBlob] = useState("");
+  const pcRef = useRef(null);
+  const dcRef = useRef(null);
+  const [isHost, setIsHost] = useState(true); // Host is side "A"
+
+  // Game
+  const [game, setGame] = useState(initialState);
+  const [myPick, setMyPick] = useState(null); // number chosen this round
+  const [opPick, setOpPick] = useState(null);
+  const [waiting, setWaiting] = useState(false);
+  const [log, setLog] = useState([]);
+
+  const mySide = isHost ? "A" : "B";
+  const iAmAttacker = game.attackerSide === mySide;
+  const iAmDefender = !iAmAttacker;
+
+  const validChoices = game.phase === "pass" ? [1, 2, 3] : [4, 5, 6];
+
+  // --- Messaging ---
+  function send(msg) {
+    try { dcRef.current?.send(JSON.stringify(msg)); } catch {}
+  }
+
+  function appendLog(line) {
+    setLog(prev => [line, ...prev].slice(0, 200));
+  }
+
+  function resetPicks() {
+    setMyPick(null);
+    setOpPick(null);
+    setWaiting(false);
+  }
+
+  function hardReset() {
+    setGame({ ...initialState, attackerSide: "A" });
+    setLog([]);
+    resetPicks();
+  }
+
+  // Host authoritative resolution
+  const roundBufferRef = useRef({ A: null, B: null });
+
+  function handleIncoming(data) {
+    const msg = JSON.parse(data);
+    if (msg.type === "hello") {
+      appendLog(`Connected to ${msg.side}`);
+      return;
+    }
+    if (msg.type === "choice") {
+      roundBufferRef.current[msg.side] = msg.value;
+      setOpPick(msg.value);
+      // If host has both choices, resolve and broadcast state
+      if (isHost) {
+        const aPick = roundBufferRef.current.A;
+        const bPick = roundBufferRef.current.B;
+        if (aPick !== null && bPick !== null) {
+          const attackerPick = game.attackerSide === "A" ? aPick : bPick;
+          const defenderPick = game.attackerSide === "A" ? bPick : aPick;
+          const nextState = resolveRound(game, attackerPick, defenderPick);
+          // Broadcast
+          send({ type: "state", state: nextState, resolve: { attackerPick, defenderPick }});
+          setGame(nextState);
+          appendLog(nextState.lastResult);
+          roundBufferRef.current = { A: null, B: null };
+          resetPicks();
+        }
+      }
+      return;
+    }
+    if (msg.type === "state") {
+      // Non‑host applies authoritative state
+      if (!isHost) {
+        setGame(msg.state);
+        appendLog(msg.state.lastResult);
+        resetPicks();
+      }
+      return;
+    }
+    if (msg.type === "reset") {
+      hardReset();
+      return;
+    }
+  }
+
+  // --- WebRTC setup ---
+  const iceServers = useMemo(() => ({ iceServers: [{ urls: ["stun:stun.l.google.com:19302"] }] }), []);
+
+  async function createPeer(hosting) {
+    const pc = new RTCPeerConnection(iceServers);
+    pcRef.current = pc;
+
+    if (hosting) {
+      const dc = pc.createDataChannel("game");
+      dcRef.current = dc;
+      dc.onopen = () => { setConnState("connected"); appendLog("Data channel open."); send({ type: "hello", side: "A" }); };
+      dc.onmessage = (e) => handleIncoming(e.data);
+      pc.onconnectionstatechange = () => setConnState(pc.connectionState);
+      const blob = await createOfferWithIce(pc);
+      setOfferBlob(blob);
+      return;
+    }
+
+    // Joining — wait for remote offer first, then create answer
+    pc.ondatachannel = (ev) => {
+      const dc = ev.channel;
+      dcRef.current = dc;
+      dc.onopen = () => { setConnState("connected"); appendLog("Data channel open."); send({ type: "hello", side: "B" }); };
+      dc.onmessage = (e) => handleIncoming(e.data);
+    };
+    pc.onconnectionstatechange = () => setConnState(pc.connectionState);
+  }
+
+  async function startHosting() {
+    setIsHost(true);
+    setConnState("hosting");
+    await createPeer(true);
+  }
+
+  async function startJoining() {
+    setIsHost(false);
+    setConnState("joining");
+    await createPeer(false);
+  }
+
+  async function applyRemoteOfferAndCreateAnswer() {
+    try {
+      const pc = pcRef.current;
+      const desc = new RTCSessionDescription(JSON.parse(remoteBlob));
+      await pc.setRemoteDescription(desc);
+      const blob = await createAnswerWithIce(pc);
+      setAnswerBlob(blob);
+    } catch (e) {
+      alert("Invalid Offer blob");
+      console.error(e);
+    }
+  }
+
+  async function applyRemoteAnswer() {
+    try {
+      const pc = pcRef.current;
+      const desc = new RTCSessionDescription(JSON.parse(remoteBlob));
+      await pc.setRemoteDescription(desc);
+      setRemoteBlob("");
+    } catch (e) {
+      alert("Invalid Answer blob");
+      console.error(e);
+    }
+  }
+
+  // --- Gameplay actions ---
+  async function chooseNumber(n) {
+    if (myPick !== null) return; // already picked this round
+    if (!validChoices.includes(n)) return;
+
+    setMyPick(n);
+    setWaiting(true);
+
+    // Send my choice to peer (if online) or resolve locally (if local)
+    if (mode === "online") {
+      const side = mySide;
+      send({ type: "choice", side, value: n });
+      // If host and already have opponent's pick, the resolution happens in handleIncoming
+      if (!isHost) {
+        // client waits for authoritative state
+      } else {
+        // Host: also stash own pick in buffer
+        roundBufferRef.current[side] = n;
+        // If both picks already available (op picked first), resolve now
+        const aPick = roundBufferRef.current.A;
+        const bPick = roundBufferRef.current.B;
+        if (aPick !== null && bPick !== null) {
+          const attackerPick = game.attackerSide === "A" ? aPick : bPick;
+          const defenderPick = game.attackerSide === "A" ? bPick : aPick;
+          const nextState = resolveRound(game, attackerPick, defenderPick);
+          send({ type: "state", state: nextState, resolve: { attackerPick, defenderPick }});
+          setGame(nextState);
+          appendLog(nextState.lastResult);
+          roundBufferRef.current = { A: null, B: null };
+          resetPicks();
+        }
+      }
+    } else {
+      // Local hot‑seat: instantly ask for opponent pick via prompt
+      const opp = prompt(`Opponent pick (${game.phase === "pass" ? "1-3" : "4-6"})`);
+      const oppNum = Number(opp);
+      if (!Number.isInteger(oppNum)) { setWaiting(false); setMyPick(null); return; }
+      const attackerPick = iAmAttacker ? n : oppNum;
+      const defenderPick = iAmAttacker ? oppNum : n;
+      const nextState = resolveRound(game, attackerPick, defenderPick);
+      setGame(nextState);
+      appendLog(nextState.lastResult);
+      resetPicks();
+    }
+  }
+
+  function sendReset() {
+    if (mode === "online") send({ type: "reset" });
+    hardReset();
+  }
+
+  // --- UI helpers ---
+  function StatusBadge({ label }) {
+    return (
+      <span className="text-xs px-2 py-1 rounded-full bg-gray-100 border border-gray-200">{label}</span>
+    );
+  }
+
+  function Pill({ children }) {
+    return (
+      <span className="px-3 py-1 rounded-2xl bg-gray-100 text-gray-700 border border-gray-200 text-sm">{children}</span>
+    );
+  }
+
+  const ConnectionPanel = () => (
+    <div className="grid gap-3">
+      <div className="flex items-center gap-2">
+        <button
+          className={`px-3 py-2 rounded-2xl shadow ${mode === "online" ? "bg-black text-white" : "bg-white"}`}
+          onClick={() => setMode("online")}
+        >Online</button>
+        <button
+          className={`px-3 py-2 rounded-2xl shadow ${mode === "local" ? "bg-black text-white" : "bg-white"}`}
+          onClick={() => setMode("local")}
+        >Same device</button>
+      </div>
+
+      {mode === "online" && (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          {/* Host side */}
+          <div className="p-4 rounded-2xl border shadow-sm bg-white">
+            <div className="flex items-center justify-between mb-2">
+              <div className="font-semibold">Host Game (Side A)</div>
+              {isHost && <StatusBadge label={connState} />}
+            </div>
+            <div className="flex gap-2">
+              <button className="px-3 py-2 rounded-xl bg-black text-white" onClick={startHosting} disabled={connState!=="disconnected"}>
+                Host Game
+              </button>
+              <button
+                className="px-3 py-2 rounded-xl bg-gray-800 text-white disabled:opacity-40"
+                onClick={() => { navigator.clipboard.writeText(offerBlob); }} disabled={!offerBlob}
+              >Copy Offer</button>
+            </div>
+            <textarea
+              className="mt-3 w-full min-h-[120px] p-2 rounded-xl border"
+              value={offerBlob}
+              readOnly
+              placeholder="Offer blob will appear here after hosting"
+            />
+            <div className="mt-3 grid gap-2">
+              <input
+                className="p-2 rounded-xl border"
+                placeholder="Paste Answer blob here"
+                value={remoteBlob}
+                onChange={e=>setRemoteBlob(e.target.value)}
+              />
+              <button className="px-3 py-2 rounded-xl bg-emerald-600 text-white disabled:opacity-40" onClick={applyRemoteAnswer} disabled={!remoteBlob || connState==="connected"}>
+                Apply Answer
+              </button>
+            </div>
+          </div>
+
+          {/* Join side */}
+          <div className="p-4 rounded-2xl border shadow-sm bg-white">
+            <div className="flex items-center justify-between mb-2">
+              <div className="font-semibold">Join Game (Side B)</div>
+              {!isHost && <StatusBadge label={connState} />}
+            </div>
+            <div className="flex gap-2">
+              <button className="px-3 py-2 rounded-xl bg-black text-white" onClick={startJoining} disabled={connState!=="disconnected"}>
+                Join Game
+              </button>
+            </div>
+            <textarea
+              className="mt-3 w-full min-h-[120px] p-2 rounded-xl border"
+              placeholder="Paste Offer blob from Host here"
+              value={remoteBlob}
+              onChange={e=>setRemoteBlob(e.target.value)}
+            />
+            <div className="mt-2 flex gap-2">
+              <button className="px-3 py-2 rounded-xl bg-blue-600 text-white disabled:opacity-40" onClick={applyRemoteOfferAndCreateAnswer} disabled={!remoteBlob || connState!=="joining"}>
+                Create Answer
+              </button>
+              <button className="px-3 py-2 rounded-xl bg-gray-800 text-white disabled:opacity-40"
+                onClick={() => navigator.clipboard.writeText(answerBlob)} disabled={!answerBlob}>Copy Answer</button>
+            </div>
+            <textarea
+              className="mt-3 w-full min-h-[120px] p-2 rounded-xl border"
+              value={answerBlob}
+              readOnly
+              placeholder="Answer blob will appear here after creating answer"
+            />
+          </div>
+        </div>
+      )}
+
+      {mode === "local" && (
+        <div className="p-4 rounded-2xl border shadow-sm bg-white">
+          <div className="font-medium">Same‑device hot‑seat</div>
+          <div className="text-sm text-gray-600">Choose for yourself, then a prompt will ask for your opponent's choice.</div>
+        </div>
+      )}
+    </div>
+  );
+
+  const Scoreboard = () => (
+    <div className="flex items-center justify-between p-4 rounded-2xl bg-white border shadow-sm">
+      <div className="flex items-center gap-3">
+        <div className="text-lg font-semibold">Score</div>
+        <Pill>A: {game.scoreA}</Pill>
+        <Pill>B: {game.scoreB}</Pill>
+      </div>
+      <div className="flex items-center gap-2">
+        <Pill>Round {game.round}</Pill>
+        <Pill>Phase: {game.phase.toUpperCase()}</Pill>
+        <Pill>Passes: {game.passesCompleted}/3</Pill>
+        <Pill>Attacker: {game.attackerSide}</Pill>
+      </div>
+    </div>
+  );
+
+  const Controls = () => (
+    <div className="p-4 rounded-2xl bg-white border shadow-sm">
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+        <div className="text-base">
+          You are <span className="font-semibold">Side {mySide}</span> — {iAmAttacker ? <span className="text-emerald-600 font-semibold">Attacker</span> : <span className="text-sky-600 font-semibold">Defender</span>}
+        </div>
+        <div className="flex gap-2">
+          <button className="px-3 py-2 rounded-xl bg-gray-100 border" onClick={hardReset}>Reset Local</button>
+          <button className="px-3 py-2 rounded-xl bg-rose-600 text-white" onClick={sendReset} disabled={mode!=="online" || connState!=="connected"}>Reset Both</button>
+        </div>
+      </div>
+
+      <div className="mb-2 text-sm text-gray-600">{iAmAttacker ? (game.phase === "pass" ? "Pick 1, 2 or 3 to pass." : "Pick 4, 5 or 6 to shoot.") : (game.phase === "pass" ? "Defend the pass: pick 1, 2 or 3." : "Defend the shot: pick 4, 5 or 6.")}</div>
+
+      <div className="flex flex-wrap gap-2">
+        {validChoices.map(n => (
+          <button key={n}
+            onClick={() => chooseNumber(n)}
+            disabled={myPick!==null || connState==="disconnected" && mode==="online"}
+            className={`px-4 py-3 rounded-2xl shadow border text-lg font-semibold ${myPick===n?"bg-black text-white":"bg-white"}`}>
+            {n}
+          </button>
+        ))}
+      </div>
+
+      <div className="mt-3 flex items-center gap-3">
+        <Pill>My pick: {myPick ?? "—"}</Pill>
+        <Pill>Opponent pick: {opPick ?? "—"}</Pill>
+        {waiting && <StatusBadge label="Waiting for opponent…" />}
+      </div>
+
+      {game.lastResult && (
+        <div className="mt-4 p-3 rounded-xl bg-gray-50 border text-sm">
+          <span className="font-medium">Last result:</span> {game.lastResult}
+        </div>
+      )}
+    </div>
+  );
+
+  return (
+    <div className="min-h-screen w-full bg-gradient-to-b from-gray-50 to-gray-100 p-6 md:p-10">
+      <div className="max-w-5xl mx-auto grid gap-6">
+        <h1 className="text-2xl md:text-3xl font-bold">Number Pass & Shoot — Online 1v1</h1>
+        <div className="grid gap-6">
+          <ConnectionPanel />
+          <Scoreboard />
+          <Controls />
+          <div className="p-4 rounded-2xl bg-white border shadow-sm">
+            <div className="font-semibold mb-2">Event Log</div>
+            <div className="text-xs text-gray-600">Newest at top</div>
+            <div className="mt-2 max-h-56 overflow-auto space-y-1">
+              {log.map((line, i)=> (
+                <div key={i} className="text-sm p-2 rounded-lg bg-gray-50 border">{line}</div>
+              ))}
+            </div>
+          </div>
+          <div className="text-xs text-gray-500">
+            Tip: Share this page with your friend. Host creates an Offer and sends the blob. Joiner pastes it, then sends back the Answer. Once connected, you can play without a server.
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
